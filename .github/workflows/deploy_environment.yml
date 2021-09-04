@@ -1,0 +1,257 @@
+name: Deploy Environment
+ 
+on:
+  repository_dispatch:
+    types:
+      - deployment_request
+
+jobs:
+  deploy_details:
+    name: Define Deployment Details
+
+    runs-on: ubuntu-20.04
+
+    outputs:
+      container_registry: ${{ steps.deployment_data.outputs.container_registry }}
+      namespace: ${{ steps.deployment_data.outputs.namespace }}
+
+      app_container_image: ${{ steps.deployment_data.outputs.app_container_image }}
+      app_container_version: ${{ steps.deployment_data.outputs.app_container_version }}
+
+      database_container_image: ${{ steps.deployment_data.outputs.database_container_image }}
+      database_container_version: ${{ steps.deployment_data.outputs.database_container_version }}
+
+      cloud_provider: ${{ steps.deployment_data.outputs.cloud_provider }}
+      environment_short_name: ${{ steps.deployment_data.outputs.environment_name }}
+      environment_name: ${{ steps.deployment_data.outputs.environment }}
+
+      deployment_sha: ${{ steps.deployment_data.outputs.deployment_sha }}
+      deployment_github_ref: ${{ steps.deployment_data.outputs.deployment_github_ref }}
+
+      cloud_container_registry: ${{ steps.deployment_data.outputs.cloud_container_registry }}
+      cloud_container_registry_url: ${{ steps.deployment_data.outputs.cloud_container_registry_base_url }}
+
+    steps:
+      - name: Checkout Sources
+        uses: actions/checkout@v2
+
+      - name: Extract Deployment Details and Report Deployment in Progress
+        id: deployment_data
+        uses: actions/github-script@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const scriptPath = require('path').resolve('./.github/workflows/scripts/unpack_deployment_payload.js')
+              , deploymentPayload = require(scriptPath);
+            ;
+            const deploymentUtils = deploymentPayload(context, core, github)
+            deploymentUtils.extractDeploymentDetails();
+
+
+  mirror_containers:
+    name: Mirror Containers to Cloud Provider
+
+    runs-on: ubuntu-20.04
+
+    needs:
+      - deploy_details
+
+    environment:
+      name: ${{ needs.deploy_details.outputs.cloud_provider }}
+      url: https://${{ steps.cloud_provider_parameters.outputs.container_registry }}
+
+    env:
+      GHCR_APP_IMAGE: ${{ needs.deploy_details.outputs.container_registry }}/${{ needs.deploy_details.outputs.app_container_image }}:${{ needs.deploy_details.outputs.app_container_version }}
+      GHCR_DB_IMAGE: ${{ needs.deploy_details.outputs.container_registry }}/${{ needs.deploy_details.outputs.database_container_image }}:${{ needs.deploy_details.outputs.database_container_version }}
+
+    steps:
+      - name: Checkout Sources
+        uses: actions/checkout@v2
+
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@v1
+        with:
+          username: ${{ github.actor }}
+          password: ${{ secrets.OCTODEMOBOT_GHPR_TOKEN }}
+          registry: ${{ needs.deploy_details.outputs.container_registry }}
+
+      - name: Generate Cloud Parameters
+        id: cloud_provider_parameters
+        uses: actions/github-script@v3
+        env:
+          cloud_provider: ${{ needs.deploy_details.outputs.cloud_provider }}
+          config: ${{ toJSON(needs.deploy_details.outputs) }}
+          gcp_project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const scriptPath = require('path').resolve(`./.github/workflows/scripts/cloud_parameters.js`)
+              , cloudUtils = require(scriptPath);
+            ;
+            cloudUtils.create(context, core, github).exportCloudParameters(JSON.parse(process.env.config));
+
+      - name: Fetch Container Images from GHCR and Tag for Cloud provider
+        run: |
+          docker pull $GHCR_APP_IMAGE
+          docker tag $GHCR_APP_IMAGE ${{ steps.cloud_provider_parameters.outputs.app_container_image }}
+
+          docker pull $GHCR_DB_IMAGE
+          docker tag $GHCR_DB_IMAGE ${{ steps.cloud_provider_parameters.outputs.database_container_image }}
+
+      - name: Sign in to Google Cloud Platform
+        if: needs.deploy_details.outputs.cloud_provider == 'gcp'
+        uses: google-github-actions/setup-gcloud@v0.2.1
+        with:
+          version: 320.0.0
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.GCP_ARTIFACT_REPOSITORY_ACCOUNT_KEY }}
+          export_default_credentials: true
+
+      - name: Configure Docker for GCR
+        if: needs.deploy_details.outputs.cloud_provider == 'gcp'
+        run: |
+          gcloud auth configure-docker ${{ steps.cloud_provider_parameters.outputs.container_registry }}
+
+      - name: Login to Azure Container Registry
+        if: needs.deploy_details.outputs.cloud_provider == 'azure'
+        uses: docker/login-action@v1
+        with:
+          registry: ${{ steps.cloud_provider_parameters.outputs.container_registry }}
+          username: ${{ secrets.AZURE_CONTAINER_REGISTRY_CLIENT_ID }}
+          password: ${{ secrets.AZURE_CONTAINER_REGISTRY_CLIENT_SECRET }}
+
+      - name: Push GHCR containers to Cloud Provider
+        env:
+          DOCKER_CLI_EXPERIMENTAL: enable
+        run: |
+          if docker manifest inspect ${{ steps.cloud_provider_parameters.outputs.app_container_image }} > /dev/null ; then
+            echo "${{ steps.cloud_provider_parameters.outputs.app_container_image }} already present in registry"
+          else
+            docker push ${{ steps.cloud_provider_parameters.outputs.app_container_image }}
+          fi
+
+          if docker manifest inspect ${{ steps.cloud_provider_parameters.outputs.database_container_image }} > /dev/null ; then
+            echo "${{ steps.cloud_provider_parameters.outputs.database_container_image }} already present in registry"
+          else
+            docker push ${{ steps.cloud_provider_parameters.outputs.database_container_image }}
+          fi
+
+
+  deploy_to_cloud:
+    name: Deploy to Cloud
+    runs-on: ubuntu-20.04
+
+    needs:
+      - deploy_details
+      - mirror_containers
+
+    timeout-minutes: 5
+
+    environment:
+      name: ${{ needs.deploy_details.outputs.environment_name }}
+      url: ${{ steps.clean_environment_url.outputs.url }}
+
+    env:
+      # Directory that contains Terraform HCL to run
+      TERRAFORM_WORKING_DIRECTORY: ./terraform/kubernetes
+
+    steps:
+      - name: Checkout Sources
+        uses: actions/checkout@v2
+
+      - name: HashiCorp - Setup Terraform
+        uses: hashicorp/setup-terraform@v1.3.2
+        with:
+          terraform_version: 0.14.7
+          terraform_wrapper: true
+
+      - name: Setup Terragrunt
+        uses: peter-murray/terragrunt-github-action@v1.0.0
+        with:
+          terragrunt_version: 0.28.7
+
+      - name: Sign in to Google Cloud Platform
+        if: needs.deploy_details.outputs.cloud_provider == 'gcp'
+        uses: google-github-actions/setup-gcloud@v0.2.1
+        with:
+          version: 320.0.0
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.GCP_TERRAFORM_SERVICE_ACCOUNT_KEY }}
+          export_default_credentials: true
+
+      - name: Authenticate with Kubernetes Cluster for GKE
+        if: needs.deploy_details.outputs.cloud_provider == 'gcp'
+        uses: google-github-actions/get-gke-credentials@v0.2.1
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER_NAME }}
+          location: ${{ secrets.GKE_CLUSTER_LOCATION }}
+          credentials: ${{ secrets.GCP_TERRAFORM_SERVICE_ACCOUNT_KEY }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Configure kubectl for Azure Kubernetes Services
+        if: needs.deploy_details.outputs.cloud_provider == 'azure'
+        uses: Azure/aks-set-context@v1
+        with:
+          creds: ${{ secrets.AKS_SVC_PRINCIPAL}}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+          resource-group: ${{ secrets.AZURE_RESOURCE_GROUP }}
+
+      - name: Generate and Inject Terraform Parameters
+        id: terraform_environment_variables
+        uses: actions/github-script@v3
+        env:
+          cloud_provider: ${{ needs.deploy_details.outputs.cloud_provider }}
+          config: ${{ toJSON(needs.deploy_details.outputs) }}
+
+          # All of the relevant cloud specific parameters required to connect, only one set will get used in practice
+          gcp_project_id: ${{ secrets.GCP_PROJECT_ID }}
+          azure_storage_account_resource_group: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          azure_storage_account_name: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
+          arm_access_key: ${{ secrets.ARM_ACCESS_KEY }}
+        with:
+          script: |
+            const scriptPath = require('path').resolve(`./.github/workflows/scripts/cloud_parameters.js`)
+              , cloudUtils = require(scriptPath);
+            ;
+            cloudUtils.create(context, core, github).exportTerraformParameters(JSON.parse(process.env.config));
+
+      - name: Terraform - init
+        working-directory: ${{ env.TERRAFORM_WORKING_DIRECTORY }}
+        run: terragrunt init
+
+      - name: Terraform - validate
+        working-directory: ${{ env.TERRAFORM_WORKING_DIRECTORY }}
+        run: terragrunt validate
+
+      - name: Terraform - plan
+        working-directory: ${{ env.TERRAFORM_WORKING_DIRECTORY }}
+        run: terragrunt plan
+
+      - name: Terraform - apply
+        working-directory: ${{ env.TERRAFORM_WORKING_DIRECTORY }}
+        run: terragrunt apply -auto-approve
+
+      - name: Get Website URL from Terrafom State
+        id: terraform_output
+        working-directory: ${{ env.TERRAFORM_WORKING_DIRECTORY }}
+        run: terraform output -json website_url
+
+      - name: Extract environment URL
+        id: clean_environment_url
+        uses: actions/github-script@v3
+        env:
+          terraform_url: ${{ steps.terraform_output.outputs.stdout }}
+        with:
+          script: |
+            // Terraform has started putting out quoted strings now, so we have to clean them up
+
+            const data = process.env.terraform_url;
+            let result = data.trim();
+
+            const regex = /^"(.*)"$/;
+            if (regex.test(result)) {
+              result = regex.exec(result)[1]
+            }
+
+            core.setOutput('url', result);

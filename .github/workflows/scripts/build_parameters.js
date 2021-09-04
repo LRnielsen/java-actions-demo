@@ -2,7 +2,7 @@
 // Simple script to extract build related information from the Action runtime environment to be used
 // to build up the various parameters to be passed into Maven builds
 //
-const BRANCH_REGEX = /refs\/heads\/(.*)/ 
+const BRANCH_REGEX = /refs\/heads\/(.*)/  
 
 
 class BuildParameters {
